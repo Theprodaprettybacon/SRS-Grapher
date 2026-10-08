@@ -22,6 +22,9 @@
 //   BARE_NUMBER_MEANS      How to read a session length that is just a number under 15,
 //                          like "4": "intervals" (4 x 15 min), "hours", or "unknown" (not counted)
 //   UPDATE_EVERY_MINUTES   How often the block is rewritten (default 60, on the hour)
+//   CHART_FONT             Font for all text on every chart on the dashboard tab, e.g. Times New Roman
+//   CHART_TITLE_COLOR      Colour for every chart title, as hex, e.g. #000000
+//                          (both are applied each time the bot starts; everything else about your charts is kept)
 //   CREATE_CHARTS          Set to 0 to stop the bot adding its starter charts. By default, if the
 //                          dashboard tab has no charts at all, the bot adds 12 the first time it runs
 //                          and never touches them again, so you can move and restyle them freely.
@@ -44,6 +47,8 @@ const CONFIG = {
   bareNumberMeans: (process.env.BARE_NUMBER_MEANS || 'unknown').toLowerCase(),
   dryRun: process.env.DRY_RUN === '1',
   createCharts: process.env.CREATE_CHARTS !== '0',
+  chartFont: process.env.CHART_FONT || '',
+  chartTitleColor: process.env.CHART_TITLE_COLOR || '',
   // The block is rewritten once at startup, then on this schedule. New posts are counted in memory
   // straight away and show up in the sheet at the next update.
   updateEveryMinutes: Math.max(5, parseInt(process.env.UPDATE_EVERY_MINUTES || '60', 10) || 60),
@@ -334,6 +339,10 @@ function allRecords() {
 // so chart ranges pointing at it never need changing.
 // ---------------------------------------------------------------------------
 
+// The block's first cell. The bot looks for this text to find its block, so the block (and the charts
+// pointing at it) can be moved by inserting or deleting rows and columns without breaking anything.
+const BLOCK_MARKER = 'SRS activity data, written by the log bot. Do not edit this block.';
+
 const PERIOD_HEADERS = ['Recruiting hours', 'Active recruiters', 'Events hosted', 'Average attendees', 'Joins', 'Leaves', 'Net change', 'Nudges sent'];
 
 function averageAttendees(events) {
@@ -355,7 +364,7 @@ function buildSummary(data, today, updatedText = '', opts = {}) {
   const grid = [];
   const row = (cells) => { const r = blank(); cells.forEach((c, i) => { r[i] = c; }); grid.push(r); };
 
-  row(['SRS activity data, written by the log bot. Do not edit this block.']);
+  row([BLOCK_MARKER]);
   row(['Last updated', updatedText]);
   row([]);
 
@@ -412,9 +421,9 @@ function a1(tabName, range) {
 }
 function colToNum(col) { return col.split('').reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0); }
 function numToCol(n) { let s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
-function blockRange(rows, cols) {
-  const m = CONFIG.dataCell.match(/^([A-Z]+)(\d+)$/);
-  if (!m) throw new Error(`DATA_CELL "${CONFIG.dataCell}" should look like AA1`);
+function blockRange(rows, cols, startCell = CONFIG.dataCell) {
+  const m = String(startCell).toUpperCase().match(/^([A-Z]+)(\d+)$/);
+  if (!m) throw new Error(`DATA_CELL "${startCell}" should look like AA1`);
   const c0 = colToNum(m[1]); const r0 = +m[2];
   return { c0, r0, c1: c0 + cols - 1, r1: r0 + rows - 1, a1: `${m[1]}${r0}:${numToCol(c0 + cols - 1)}${r0 + rows - 1}` };
 }
@@ -587,12 +596,82 @@ async function ensureCharts() {
       console.log(`[charts] ${CONFIG.dashboardTab} already has ${tab.charts.length} chart(s), leaving them alone`);
       return;
     }
-    const requests = buildChartRequests(tab.properties.sheetId, blockRange(36, 9));
+    const requests = buildChartRequests(tab.properties.sheetId, blockRange(36, 9, (await locateBlock()).start));
     if (CONFIG.dryRun) { console.log(`[dry run] would add ${requests.length} starter charts to ${CONFIG.dashboardTab}`); return; }
     await withRetry(() => sheets.spreadsheets.batchUpdate({ spreadsheetId: CONFIG.sheetId, requestBody: { requests } }), 'add charts');
     console.log(`[charts] added ${requests.length} starter charts to ${CONFIG.dashboardTab}`);
   } catch (err) {
     console.error('[charts] could not add the starter charts:', err.message);
+  }
+}
+
+// Every cell on the tab that holds the block's title, as 1-based { row, col }.
+function findMarkers(values) {
+  const found = [];
+  (values || []).forEach((r, i) => (r || []).forEach((v, j) => { if (v === BLOCK_MARKER) found.push({ row: i + 1, col: j + 1 }); }));
+  return found.sort((a, b) => a.col - b.col || a.row - b.row);
+}
+
+// Where the block is now: the first copy of the title found (leftmost, then topmost), or DATA_CELL if none.
+// Any other copies are left-overs from before rows or columns were moved; they get cleared.
+async function locateBlock() {
+  const res = await withRetry(
+    () => sheets.spreadsheets.values.get({ spreadsheetId: CONFIG.sheetId, range: `'${CONFIG.dashboardTab.replace(/'/g, "''")}'` }),
+    'find block'
+  );
+  const markers = findMarkers(res.data.values);
+  if (!markers.length) return { start: CONFIG.dataCell, extras: [] };
+  const toCell = (m) => `${numToCol(m.col)}${m.row}`;
+  return { start: toCell(markers[0]), extras: markers.slice(1).map(toCell) };
+}
+
+// ---------------------------------------------------------------------------
+// Chart styling (only when CHART_FONT or CHART_TITLE_COLOR is set)
+// ---------------------------------------------------------------------------
+
+function hexToRgb(hex) {
+  const m = String(hex).trim().match(/^#?([0-9a-f]{6})$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  return { red: ((n >> 16) & 255) / 255, green: ((n >> 8) & 255) / 255, blue: (n & 255) / 255 };
+}
+
+// Change only the font and title colour of a chart; everything else stays as you set it.
+function restyleSpec(spec, font, titleRgb) {
+  const s = JSON.parse(JSON.stringify(spec));
+  const setFont = (tf) => { if (font && tf) tf.fontFamily = font; };
+  if (font) s.fontName = font;
+  s.titleTextFormat = s.titleTextFormat || {};
+  setFont(s.titleTextFormat);
+  if (titleRgb) { delete s.titleTextFormat.foregroundColor; s.titleTextFormat.foregroundColorStyle = { rgbColor: titleRgb }; }
+  if (s.subtitleTextFormat) setFont(s.subtitleTextFormat);
+  const bc = s.basicChart;
+  if (bc) {
+    for (const se of bc.series || []) if (se.dataLabel) { se.dataLabel.textFormat = se.dataLabel.textFormat || {}; setFont(se.dataLabel.textFormat); }
+    for (const ax of bc.axis || []) { if (ax.format) setFont(ax.format); if (ax.titleTextFormat) setFont(ax.titleTextFormat); }
+    if (bc.totalDataLabel && bc.totalDataLabel.textFormat) setFont(bc.totalDataLabel.textFormat);
+  }
+  return s;
+}
+
+async function styleCharts() {
+  const titleRgb = CONFIG.chartTitleColor ? hexToRgb(CONFIG.chartTitleColor) : null;
+  if (CONFIG.chartTitleColor && !titleRgb) console.warn(`[charts] CHART_TITLE_COLOR "${CONFIG.chartTitleColor}" is not a hex colour like #000000, ignoring it`);
+  if (!CONFIG.chartFont && !titleRgb) return;
+  try {
+    const meta = await withRetry(
+      () => sheets.spreadsheets.get({ spreadsheetId: CONFIG.sheetId, fields: 'sheets.properties.title,sheets.charts.chartId,sheets.charts.spec' }),
+      'read charts'
+    );
+    const tab = (meta.data.sheets || []).find((x) => x.properties.title === CONFIG.dashboardTab);
+    const charts = (tab && tab.charts) || [];
+    if (!charts.length) return;
+    const requests = charts.map((c) => ({ updateChartSpec: { chartId: c.chartId, spec: restyleSpec(c.spec, CONFIG.chartFont, titleRgb) } }));
+    if (CONFIG.dryRun) { console.log(`[dry run] would restyle ${requests.length} charts`); return; }
+    await withRetry(() => sheets.spreadsheets.batchUpdate({ spreadsheetId: CONFIG.sheetId, requestBody: { requests } }), 'restyle charts');
+    console.log(`[charts] restyled ${requests.length} charts${CONFIG.chartFont ? ` (font ${CONFIG.chartFont})` : ''}${titleRgb ? ` (titles ${CONFIG.chartTitleColor})` : ''}`);
+  } catch (err) {
+    console.error('[charts] could not restyle the charts:', err.message);
   }
 }
 
@@ -607,7 +686,13 @@ function writeNow() {
         timeZone: CONFIG.timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
       }).format(now).replace(',', '');
       const grid = buildSummary({ ...allRecords(), events }, todaySerial(), `${stamp} (${CONFIG.timeZone})`);
-      const b = blockRange(grid.length, grid[0].length);
+      const where = await locateBlock();
+      const b = blockRange(grid.length, grid[0].length, where.start);
+      if (where.extras.length && !CONFIG.dryRun) {
+        const ranges = where.extras.map((c) => a1(CONFIG.dashboardTab, blockRange(grid.length, grid[0].length, c).a1));
+        await withRetry(() => sheets.spreadsheets.values.batchClear({ spreadsheetId: CONFIG.sheetId, requestBody: { ranges } }), 'clear old copies');
+        console.log(`[sheets] cleared ${ranges.length} old copy(ies) of the block: ${ranges.join(', ')}`);
+      }
       if (CONFIG.dryRun) {
         console.log(`[dry run] would write ${CONFIG.dashboardTab}!${b.a1}:`);
         for (const r of grid) console.log('  ' + r.map((c) => (c === '' ? '.' : c)).join(' | '));
@@ -746,6 +831,7 @@ async function start() {
     }
     await writeNow();
     await ensureCharts();
+    await styleCharts();
     console.log('[bot] watching for new posts');
     startSchedule();
   });
@@ -778,5 +864,5 @@ if (require.main === module) {
 
 module.exports = {
   forwardedOriginal, parseFields, parseMinutes, splitUsernames, firstUsername, buildRows, sheetsSerial, labelToKey,
-  recordsFromMessage, memberLogType, handleMessage, cache, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
+  restyleSpec, hexToRgb, findMarkers, BLOCK_MARKER, recordsFromMessage, memberLogType, handleMessage, cache, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
 };
