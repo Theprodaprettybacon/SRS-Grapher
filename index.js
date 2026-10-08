@@ -19,6 +19,9 @@
 //   BARE_NUMBER_MEANS      How to read a session length that is just a number under 15,
 //                          like "4": "intervals" (4 x 15 min), "hours", or "unknown" (not counted)
 //   UPDATE_EVERY_MINUTES   How often the block is rewritten (default 60, on the hour)
+//   CREATE_CHARTS          Set to 0 to stop the bot adding its starter charts. By default, if the
+//                          dashboard tab has no charts at all, the bot adds 12 the first time it runs
+//                          and never touches them again, so you can move and restyle them freely.
 //   TIME_ZONE              Override the timezone; by default the sheet's own timezone is used
 //   DRY_RUN                Set to 1 to print the block instead of writing it
 
@@ -37,6 +40,7 @@ const CONFIG = {
   backfillSince: process.env.BACKFILL_SINCE || '2025-12-01',
   bareNumberMeans: (process.env.BARE_NUMBER_MEANS || 'unknown').toLowerCase(),
   dryRun: process.env.DRY_RUN === '1',
+  createCharts: process.env.CREATE_CHARTS !== '0',
   // The block is rewritten once at startup, then on this schedule. New posts are counted in memory
   // straight away and show up in the sheet at the next update.
   updateEveryMinutes: Math.max(5, parseInt(process.env.UPDATE_EVERY_MINUTES || '60', 10) || 60),
@@ -479,6 +483,101 @@ async function readEvents() {
   return parseEventRows(res.data.values);
 }
 
+// ---------------------------------------------------------------------------
+// Starter charts. Added once, only when the dashboard tab has no charts yet.
+// ---------------------------------------------------------------------------
+
+const BLUE = { red: 0.16, green: 0.47, blue: 0.84 };   // #2a78d6
+const ORANGE = { red: 0.92, green: 0.41, blue: 0.2 };  // #eb6834
+
+// Block layout (1-based rows inside the block): weekday header row 5, data 6-12;
+// weekly header 15, data 16-27; monthly header 30, data 31-36. Column 0 holds the labels.
+const SECTIONS = { weekday: [5, 12], week: [15, 27], month: [30, 36] };
+
+function buildChartRequests(sheetId, block) {
+  const range = (section, col) => {
+    const [h, last] = SECTIONS[section];
+    return {
+      sheetId,
+      startRowIndex: block.r0 - 1 + h - 1,
+      endRowIndex: block.r0 - 1 + last,
+      startColumnIndex: block.c0 - 1 + col,
+      endColumnIndex: block.c0 + col,
+    };
+  };
+  const chart = (title, type, section, cols, slotRow, slotCol, opts = {}) => {
+    const series = cols.map((col, i) => {
+      const s = { series: { sourceRange: { sources: [range(section, col)] } }, targetAxis: 'LEFT_AXIS', colorStyle: { rgbColor: i === 0 ? BLUE : ORANGE } };
+      if (type === 'LINE') { s.lineStyle = { width: 2 }; s.pointStyle = { shape: 'CIRCLE', size: 5 }; }
+      if (opts.labels) s.dataLabel = { type: 'DATA', placement: 'OUTSIDE_END' };
+      return s;
+    });
+    const left = { position: 'LEFT_AXIS' };
+    if (type === 'LINE') left.viewWindowOptions = { viewWindowMin: 0, viewWindowMode: 'EXPLICIT' };
+    return {
+      addChart: {
+        chart: {
+          spec: {
+            title,
+            titleTextFormat: { bold: true, fontSize: 12 },
+            basicChart: {
+              chartType: type,
+              legendPosition: cols.length > 1 ? 'TOP_LEGEND' : 'NO_LEGEND',
+              axis: [{ position: 'BOTTOM_AXIS' }, left],
+              domains: [{ domain: { sourceRange: { sources: [range(section, 0)] } } }],
+              series,
+              headerCount: 1,
+            },
+          },
+          position: {
+            overlayPosition: {
+              anchorCell: { sheetId, rowIndex: slotRow * 15, columnIndex: slotCol * 5 },
+              offsetXPixels: 10, offsetYPixels: 10, widthPixels: 470, heightPixels: 290,
+            },
+          },
+        },
+      },
+    };
+  };
+  // Three charts per row, four rows, in columns A to O. Move them wherever you like afterwards.
+  return [
+    chart('Recruiting hours by weekday (last 28 days)', 'COLUMN', 'weekday', [1], 0, 0, { labels: true }),
+    chart('Events hosted by weekday (last 28 days)', 'COLUMN', 'weekday', [2], 0, 1, { labels: true }),
+    chart('Average attendees by weekday (last 28 days)', 'COLUMN', 'weekday', [3], 0, 2, { labels: true }),
+    chart('Recruiting hours per week', 'LINE', 'week', [1], 1, 0),
+    chart('Events hosted per week', 'LINE', 'week', [3], 1, 1),
+    chart('Joins and leaves per week', 'LINE', 'week', [5, 6], 1, 2),
+    chart('Active recruiters per week', 'LINE', 'week', [2], 2, 0),
+    chart('Average attendees per week', 'LINE', 'week', [4], 2, 1),
+    chart('Net member change per week', 'COLUMN', 'week', [7], 2, 2),
+    chart('Recruiting hours per month', 'COLUMN', 'month', [1], 3, 0, { labels: true }),
+    chart('Events hosted per month', 'COLUMN', 'month', [3], 3, 1, { labels: true }),
+    chart('Joins and leaves per month', 'COLUMN', 'month', [5, 6], 3, 2, { labels: true }),
+  ];
+}
+
+async function ensureCharts() {
+  if (!CONFIG.createCharts) return;
+  try {
+    const meta = await withRetry(
+      () => sheets.spreadsheets.get({ spreadsheetId: CONFIG.sheetId, fields: 'sheets.properties.title,sheets.properties.sheetId,sheets.charts.chartId' }),
+      'check for charts'
+    );
+    const tab = (meta.data.sheets || []).find((s) => s.properties.title === CONFIG.dashboardTab);
+    if (!tab) return;
+    if ((tab.charts || []).length) {
+      console.log(`[charts] ${CONFIG.dashboardTab} already has ${tab.charts.length} chart(s), leaving them alone`);
+      return;
+    }
+    const requests = buildChartRequests(tab.properties.sheetId, blockRange(36, 9));
+    if (CONFIG.dryRun) { console.log(`[dry run] would add ${requests.length} starter charts to ${CONFIG.dashboardTab}`); return; }
+    await withRetry(() => sheets.spreadsheets.batchUpdate({ spreadsheetId: CONFIG.sheetId, requestBody: { requests } }), 'add charts');
+    console.log(`[charts] added ${requests.length} starter charts to ${CONFIG.dashboardTab}`);
+  } catch (err) {
+    console.error('[charts] could not add the starter charts:', err.message);
+  }
+}
+
 let writeChain = Promise.resolve();
 
 function writeNow() {
@@ -598,6 +697,7 @@ async function start() {
       console.error('[backfill] failed:', err);
     }
     await writeNow();
+    await ensureCharts();
     console.log('[bot] watching for new posts');
     startSchedule();
   });
@@ -630,5 +730,5 @@ if (require.main === module) {
 
 module.exports = {
   parseFields, parseMinutes, splitUsernames, firstUsername, buildRows, sheetsSerial, labelToKey,
-  recordsFromMessage, buildSummary, parseEventRows, blockRange, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
+  recordsFromMessage, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
 };
