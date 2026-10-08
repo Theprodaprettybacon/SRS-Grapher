@@ -1,0 +1,16 @@
+{
+  "name": "srs-log-bot",
+  "version": "1.0.0",
+  "description": "Copies SRS time, onboard, nudge and resignation logs from Discord into the SRS Activity Dashboard sheet",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "googleapis": "^184.0.0"
+  }
+}
