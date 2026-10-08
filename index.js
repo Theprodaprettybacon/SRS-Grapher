@@ -1,6 +1,7 @@
 // SRS Log Bot
 // Reads the SRS log channels on Discord and writes one row per log into the
-// SRS Activity Dashboard Google Sheet (tabs: Time, Onboards, Nudges, Departures).
+// v2 SRS ORBAT (tabs: Time Logs, Onboard Logs, Nudge Logs, Departure Logs).
+// Run setup-orbat.gs in the ORBAT first so those tabs exist.
 //
 // Environment variables (set these on Railway, or in your shell):
 //   DISCORD_TOKEN          Bot token from the Discord Developer Portal
@@ -10,7 +11,8 @@
 //   NUDGE_CHANNEL_ID       #recruitment-nudge-archive
 //   DEPARTURE_CHANNEL_ID   #inactivity-resignation-notice
 // Optional:
-//   SHEET_ID               Defaults to the SRS Activity Dashboard
+//   SHEET_ID               Defaults to the v2 SRS ORBAT
+//   TIME_TAB, ONBOARD_TAB, NUDGE_TAB, DEPARTURE_TAB   Tab names, if you rename the log tabs
 //   BACKFILL_SINCE         Oldest post to copy on startup, YYYY-MM-DD (default 2025-12-01)
 //   BARE_NUMBER_MEANS      How to read a session length that is just a number under 15,
 //                          like "4": "intervals" (4 x 15 min), "hours", or "unknown" (left blank)
@@ -23,8 +25,8 @@
 // ---------------------------------------------------------------------------
 
 const CONFIG = {
-  sheetId: process.env.SHEET_ID || '1N_Ux_613Oc8xuENK_aSQUUgm-zh0mTCtCH6UrIn0OeM',
-  timeZone: 'America/Toronto',
+  sheetId: process.env.SHEET_ID || '1bYLV-0ddujV1dvWd33C69H290sGTagrSUNlw76nHKqM',
+  timeZone: 'America/Toronto', // replaced at startup with the sheet's own timezone
   backfillSince: process.env.BACKFILL_SINCE || '2025-12-01',
   bareNumberMeans: (process.env.BARE_NUMBER_MEANS || 'unknown').toLowerCase(),
   dryRun: process.env.DRY_RUN === '1',
@@ -40,10 +42,10 @@ const CONFIG = {
 // Where each kind of log goes in the sheet. idCol is the Message ID column,
 // lastCol is the last column the bot writes (grey formula columns come after it).
 const TABS = {
-  time: { name: 'Time', lastCol: 'E', idCol: 'E' },           // Timestamp, Recruiter, Minutes, Vouched by, Message ID
-  onboard: { name: 'Onboards', lastCol: 'D', idCol: 'D' },    // Timestamp, New member, Recruited by, Message ID
-  nudge: { name: 'Nudges', lastCol: 'D', idCol: 'D' },        // Timestamp, Member, Nudged by, Message ID
-  departure: { name: 'Departures', lastCol: 'E', idCol: 'E' }, // Timestamp, Member, Rank, Reason, Message ID
+  time: { name: process.env.TIME_TAB || 'Time Logs', lastCol: 'E', idCol: 'E' },                // Timestamp, Recruiter, Minutes, Vouched by, Message ID
+  onboard: { name: process.env.ONBOARD_TAB || 'Onboard Logs', lastCol: 'D', idCol: 'D' },       // Timestamp, New member, Recruited by, Message ID
+  nudge: { name: process.env.NUDGE_TAB || 'Nudge Logs', lastCol: 'D', idCol: 'D' },             // Timestamp, Member, Nudged by, Message ID
+  departure: { name: process.env.DEPARTURE_TAB || 'Departure Logs', lastCol: 'E', idCol: 'E' }, // Timestamp, Member, Rank, Reason, Message ID
 };
 
 // ---------------------------------------------------------------------------
@@ -277,6 +279,22 @@ async function connectSheets() {
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
   sheets = google.sheets({ version: 'v4', auth });
+
+  // Write times in the sheet's own timezone so they line up with TODAY() and the weekday charts.
+  const meta = await withRetry(
+    () => sheets.spreadsheets.get({ spreadsheetId: CONFIG.sheetId, fields: 'properties.timeZone,sheets.properties.title' }),
+    'read sheet settings'
+  );
+  if (meta.data.properties && meta.data.properties.timeZone) CONFIG.timeZone = meta.data.properties.timeZone;
+  console.log(`[sheets] connected, writing times in ${CONFIG.timeZone}`);
+  const titles = new Set((meta.data.sheets || []).map((s) => s.properties.title));
+  const missing = Object.values(TABS).map((t) => t.name).filter((n) => !titles.has(n));
+  if (missing.length) throw new Error(`these tabs are missing from the sheet: ${missing.join(', ')}. Run setup-orbat.gs first.`);
+}
+
+// A1 range with the tab name quoted, since the tab names have spaces.
+function a1(tabName, range) {
+  return `'${tabName.replace(/'/g, "''")}'!${range}`;
 }
 
 async function withRetry(fn, label) {
@@ -298,7 +316,7 @@ async function withRetry(fn, label) {
 async function loadLoggedIds() {
   for (const [kind, tab] of Object.entries(TABS)) {
     const res = await withRetry(
-      () => sheets.spreadsheets.values.get({ spreadsheetId: CONFIG.sheetId, range: `${tab.name}!${tab.idCol}2:${tab.idCol}` }),
+      () => sheets.spreadsheets.values.get({ spreadsheetId: CONFIG.sheetId, range: a1(tab.name, `${tab.idCol}2:${tab.idCol}`) }),
       `read ${tab.name} IDs`
     );
     for (const row of res.data.values || []) if (row[0]) loggedIds[kind].add(String(row[0]));
@@ -318,7 +336,7 @@ async function flush() {
       await withRetry(
         () => sheets.spreadsheets.values.append({
           spreadsheetId: CONFIG.sheetId,
-          range: `${tab.name}!A:${tab.lastCol}`,
+          range: a1(tab.name, `A:${tab.lastCol}`),
           valueInputOption: 'RAW',
           insertDataOption: 'INSERT_ROWS',
           requestBody: { values: rows },
