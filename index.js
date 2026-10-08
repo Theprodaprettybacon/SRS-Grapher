@@ -10,6 +10,9 @@
 //   ONBOARD_CHANNEL_ID     #recruitment-onboard-archive
 //   NUDGE_CHANNEL_ID       #recruitment-nudge-archive
 //   DEPARTURE_CHANNEL_ID   #inactivity-resignation-notice
+//   MEMBER_LOG_CHANNEL_ID  Dyno's join/leave log channel. When this is set, Joins and Leaves come from
+//                          Dyno's "Member Joined" / "Member Left" posts, and ONBOARD_CHANNEL_ID and
+//                          DEPARTURE_CHANNEL_ID are not used (you can leave them out).
 // Optional:
 //   DASHBOARD_TAB          Tab the numbers go on (default "Sheet12")
 //   DATA_CELL              Top-left cell of the block (default "AA1"); the block is 9 columns x 36 rows
@@ -52,6 +55,7 @@ const CONFIG = {
     onboard: process.env.ONBOARD_CHANNEL_ID,
     nudge: process.env.NUDGE_CHANNEL_ID,
     departure: process.env.DEPARTURE_CHANNEL_ID,
+    memberLog: process.env.MEMBER_LOG_CHANNEL_ID,
   },
 };
 
@@ -239,17 +243,31 @@ function sheetsSerial(date, timeZone = CONFIG.timeZone) {
 
 // Turn one Discord message into sheet rows for its tab. Returns { rows, warning }.
 // A message without a "Username:" line is not a log (chat, staff replies) and gives no rows.
-function buildRows(kind, message) {
-  const f = parseFields(messageText(message));
+// A forwarded post keeps its text in a "snapshot" instead of the message itself.
+function forwardedOriginal(message) {
+  const snaps = message && message.messageSnapshots;
+  if (!snaps || !snaps.size) return null;
+  return typeof snaps.first === 'function' ? snaps.first() : snaps.values().next().value;
+}
+
+function buildRows(kind, outer) {
+  const snap = forwardedOriginal(outer);
+  const message = snap ? { ...snap, id: outer.id, url: outer.url, member: outer.member, author: outer.author } : outer;
+  const f = parseFields(messageText(outer) + (snap ? '\n' + messageText(snap) : ''));
   if (!('username' in f)) return { rows: [], warning: null };
-  const when = sheetsSerial(message.createdAt);
+  // Count a forwarded log on the day it was originally posted.
+  const created = snap && snap.createdAt instanceof Date && !isNaN(snap.createdAt) ? snap.createdAt : outer.createdAt;
+  const when = sheetsSerial(created);
   const id = String(message.id);
   const poster = firstUsername(f.username, message) || (message.member && message.member.displayName) || (message.author && message.author.username) || '';
   let warning = null;
 
   if (kind === 'time') {
-    let minutes = parseMinutes(f.length);
-    if (minutes == null) minutes = parseMinutes(f.timeSpent);
+    // A bare number like "2" is ambiguous, so a clock range like "15:56 - 17:56" wins over it.
+    const fromTimeSpent = parseMinutes(f.timeSpent, 'unknown');
+    const lengthIsBare = /^\s*\d+(\.\d+)?\s*$/.test(f.length || '') && parseFloat(f.length) < 15;
+    let minutes = lengthIsBare && fromTimeSpent != null ? fromTimeSpent : parseMinutes(f.length);
+    if (minutes == null) minutes = fromTimeSpent;
     if (minutes == null) warning = `could not read the session length ("${f.length || f.timeSpent || ''}")`;
     return { rows: [[when, poster, minutes == null ? '' : minutes, firstUsername(f.vouchedBy || '', message), id]], warning };
   }
@@ -627,8 +645,28 @@ function startSchedule() {
 // Discord
 // ---------------------------------------------------------------------------
 
+// With a Dyno member log set, joins and leaves come only from it, never from the onboard/resignation channels.
+function activeChannels() {
+  const c = { ...CONFIG.channels };
+  if (c.memberLog) { delete c.onboard; delete c.departure; } else delete c.memberLog;
+  return c;
+}
+
 function kindForChannel(channelId) {
-  for (const [kind, id] of Object.entries(CONFIG.channels)) if (id && id === channelId) return kind;
+  for (const [kind, id] of Object.entries(activeChannels())) if (id && id === channelId) return kind;
+  return null;
+}
+
+// Dyno posts an embed whose header says "Member Joined" or "Member Left".
+function memberLogType(message) {
+  const parts = [message.content || ''];
+  for (const e of message.embeds || []) {
+    parts.push((e.author && e.author.name) || '', e.title || '', e.description || '');
+    for (const f of e.fields || []) parts.push(f.name || '');
+  }
+  const text = parts.join('\n');
+  if (/\bmember\s+joined\b/i.test(text)) return 'join';
+  if (/\bmember\s+left\b/i.test(text)) return 'leave';
   return null;
 }
 
@@ -638,6 +676,14 @@ function handleMessage(message, client) {
   if (client && client.user && message.author && message.author.id === client.user.id) return;
   const kind = kindForChannel(message.channelId);
   if (!kind) return;
+  if (kind === 'memberLog') {
+    const id = String(message.id);
+    cache.onboard.delete(id);
+    cache.departure.delete(id);
+    const type = memberLogType(message);
+    if (type) (type === 'join' ? cache.onboard : cache.departure).set(id, [{ day: Math.floor(sheetsSerial(message.createdAt)) }]);
+    return;
+  }
   const { records, warning } = recordsFromMessage(kind, message);
   if (records.length) cache[kind].set(String(message.id), records);
   else cache[kind].delete(String(message.id));
@@ -646,12 +692,13 @@ function handleMessage(message, client) {
 
 function handleDelete(message) {
   const kind = message && kindForChannel(message.channelId);
-  if (kind) cache[kind].delete(String(message.id));
+  if (kind === 'memberLog') { cache.onboard.delete(String(message.id)); cache.departure.delete(String(message.id)); }
+  else if (kind) cache[kind].delete(String(message.id));
 }
 
 async function backfill(client) {
   const since = new Date(`${CONFIG.backfillSince}T00:00:00Z`).getTime();
-  for (const [kind, channelId] of Object.entries(CONFIG.channels)) {
+  for (const [kind, channelId] of Object.entries(activeChannels())) {
     if (!channelId) { console.warn(`[backfill] no channel ID set for ${kind}, skipping`); continue; }
     let channel;
     try {
@@ -674,7 +721,8 @@ async function backfill(client) {
       before = batch.last().id;
       if (reachedOld || batch.size < 100) break;
     }
-    console.log(`[backfill] #${channel.name}: read ${read} posts, ${cache[kind].size} counted as logs`);
+    if (kind === 'memberLog') console.log(`[backfill] #${channel.name}: read ${read} posts, ${cache.onboard.size} joins and ${cache.departure.size} leaves`);
+    else console.log(`[backfill] #${channel.name}: read ${read} posts, ${cache[kind].size} counted as logs`);
   }
 }
 
@@ -729,6 +777,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  parseFields, parseMinutes, splitUsernames, firstUsername, buildRows, sheetsSerial, labelToKey,
-  recordsFromMessage, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
+  forwardedOriginal, parseFields, parseMinutes, splitUsernames, firstUsername, buildRows, sheetsSerial, labelToKey,
+  recordsFromMessage, memberLogType, handleMessage, cache, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
 };
