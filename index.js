@@ -221,12 +221,12 @@ function parseMinutes(value, bareNumberMeans = CONFIG.bareNumberMeans) {
   const hm = t.match(/^(\d{1,2}):(\d{2})$/);
   if (hm) return +hm[1] * 60 + +hm[2];
 
-  // A bare number
-  const bare = t.match(/^(\d+(?:\.\d+)?)$/);
+  // A bare number, ignoring stray punctuation like "2.75?" or "1."
+  const bare = t.replace(/[?!.~]+$/, '').match(/^(\d+(?:\.\d+)?)$/);
   if (bare) {
     const n = parseFloat(bare[1]);
     if (n >= 15) return Math.round(n);
-    if (!Number.isInteger(n)) return Math.round(n * 60); // 1.5 means hours
+    if (bare[1].includes('.')) return Math.round(n * 60); // "1.5" or "1.0" means hours
     if (bareNumberMeans === 'intervals') return n * 15;
     if (bareNumberMeans === 'hours') return n * 60;
     return null;
