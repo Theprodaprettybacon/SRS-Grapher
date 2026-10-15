@@ -554,7 +554,8 @@ const ORANGE = { red: 0.92, green: 0.41, blue: 0.2 };  // #eb6834
 
 // Block layout (1-based rows inside the block): weekday header row 5, data 6-12;
 // weekly header 15, data 16-27; monthly header 30, data 31-36. Column 0 holds the labels.
-const SECTIONS = { weekday: [5, 12], week: [15, 27], month: [30, 36] };
+const SECTIONS = { weekday: [5, 12], week: [15, 27], month: [30, 36], leaders: [39, 49] };
+const LEADERBOARD_TITLES = ['Top recruiters this week (hours)', 'Top recruiters this month (hours)'];
 
 function buildChartRequests(sheetId, block) {
   const range = (section, col) => {
@@ -616,6 +617,70 @@ function buildChartRequests(sheetId, block) {
     chart('Events hosted per month', 'COLUMN', 'month', [3], 3, 1, { labels: true }),
     chart('Joins and leaves per month', 'COLUMN', 'month', [5, 6], 3, 2, { labels: true }),
   ];
+}
+
+// Two horizontal bar charts for the leaderboards, placed under the lowest existing chart.
+function buildLeaderboardChartRequests(sheetId, block, anchorRow, missing) {
+  const r = (col) => ({
+    sheetId,
+    startRowIndex: block.r0 - 1 + SECTIONS.leaders[0] - 1,
+    endRowIndex: block.r0 - 1 + SECTIONS.leaders[1],
+    startColumnIndex: block.c0 - 1 + col,
+    endColumnIndex: block.c0 + col,
+  });
+  const make = (title, nameCol, hoursCol, slotCol) => ({
+    addChart: {
+      chart: {
+        spec: {
+          title,
+          titleTextFormat: { bold: true, fontSize: 12 },
+          basicChart: {
+            chartType: 'BAR',
+            legendPosition: 'NO_LEGEND',
+            axis: [{ position: 'BOTTOM_AXIS' }, { position: 'LEFT_AXIS' }],
+            domains: [{ domain: { sourceRange: { sources: [r(nameCol)] } } }],
+            series: [{ series: { sourceRange: { sources: [r(hoursCol)] } }, targetAxis: 'BOTTOM_AXIS', colorStyle: { rgbColor: BLUE }, dataLabel: { type: 'DATA', placement: 'OUTSIDE_END' } }],
+            headerCount: 1,
+          },
+        },
+        position: { overlayPosition: { anchorCell: { sheetId, rowIndex: anchorRow, columnIndex: slotCol * 5 }, offsetXPixels: 10, offsetYPixels: 10, widthPixels: 470, heightPixels: 330 } },
+      },
+    },
+  });
+  const all = [make(LEADERBOARD_TITLES[0], 1, 2, 0), make(LEADERBOARD_TITLES[1], 6, 7, 1)];
+  return all.filter((req) => missing.includes(req.addChart.chart.spec.title));
+}
+
+async function ensureLeaderboardCharts() {
+  if (!CONFIG.createCharts) return;
+  try {
+    const meta = await withRetry(
+      () => sheets.spreadsheets.get({ spreadsheetId: CONFIG.sheetId, fields: 'sheets.properties,sheets.charts.chartId,sheets.charts.spec.title,sheets.charts.position' }),
+      'check for leaderboard charts'
+    );
+    const tab = (meta.data.sheets || []).find((x) => x.properties.title === CONFIG.dashboardTab);
+    if (!tab) return;
+    const charts = tab.charts || [];
+    const titles = new Set(charts.map((c) => (c.spec && c.spec.title) || ''));
+    const missing = LEADERBOARD_TITLES.filter((t) => !titles.has(t));
+    if (!missing.length) return;
+
+    // Put them 16 rows below the lowest chart already on the tab.
+    const lowest = charts.reduce((m, c) => {
+      const a = c.position && c.position.overlayPosition && c.position.overlayPosition.anchorCell;
+      return Math.max(m, a && typeof a.rowIndex === 'number' ? a.rowIndex : 0);
+    }, -1);
+    const anchorRow = charts.length ? lowest + 16 : 0;
+    const requests = [];
+    const rows = (tab.properties.gridProperties && tab.properties.gridProperties.rowCount) || 1000;
+    if (rows < anchorRow + 20) requests.push({ appendDimension: { sheetId: tab.properties.sheetId, dimension: 'ROWS', length: anchorRow + 20 - rows } });
+    requests.push(...buildLeaderboardChartRequests(tab.properties.sheetId, blockRange(BLOCK_ROWS, 9, (await locateBlock()).start), anchorRow, missing));
+    if (CONFIG.dryRun) { console.log(`[dry run] would add ${missing.length} leaderboard chart(s) at row ${anchorRow + 1}`); return; }
+    await withRetry(() => sheets.spreadsheets.batchUpdate({ spreadsheetId: CONFIG.sheetId, requestBody: { requests } }), 'add leaderboard charts');
+    console.log(`[charts] added ${missing.length} leaderboard chart(s) at row ${anchorRow + 1} of ${CONFIG.dashboardTab}`);
+  } catch (err) {
+    console.error('[charts] could not add the leaderboard charts:', err.message);
+  }
 }
 
 async function ensureCharts() {
@@ -866,6 +931,7 @@ async function start() {
     }
     await writeNow();
     await ensureCharts();
+    await ensureLeaderboardCharts();
     await styleCharts();
     console.log('[bot] watching for new posts');
     startSchedule();
@@ -899,5 +965,5 @@ if (require.main === module) {
 
 module.exports = {
   forwardedOriginal, parseFields, parseMinutes, splitUsernames, firstUsername, buildRows, sheetsSerial, labelToKey,
-  restyleSpec, hexToRgb, leaderboard, findMarkers, BLOCK_MARKER, recordsFromMessage, memberLogType, handleMessage, cache, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
+  buildLeaderboardChartRequests, restyleSpec, hexToRgb, leaderboard, findMarkers, BLOCK_MARKER, recordsFromMessage, memberLogType, handleMessage, cache, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
 };
