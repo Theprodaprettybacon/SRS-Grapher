@@ -1,6 +1,6 @@
 // SRS Log Bot
 // Reads the SRS log channels on Discord plus the ORBAT's Event Logs tab, works out the
-// activity numbers, and writes them into ONE block on your dashboard tab (AA1:AI36 by default).
+// activity numbers, and writes them into ONE block on your dashboard tab (AA1:AI49 by default).
 // Point your charts at that block. The bot never adds tabs and never touches anything outside it.
 //
 // Environment variables (set these on Railway):
@@ -15,7 +15,7 @@
 //                          DEPARTURE_CHANNEL_ID are not used (you can leave them out).
 // Optional:
 //   DASHBOARD_TAB          Tab the numbers go on (default "Sheet12")
-//   DATA_CELL              Top-left cell of the block (default "AA1"); the block is 9 columns x 36 rows
+//   DATA_CELL              Top-left cell of the block (default "AA1"); the block is 9 columns x 49 rows
 //   SHEET_ID               Defaults to the v2 SRS ORBAT
 //   EVENT_RANGE            Where events are read from (default 'Event Logs'!B9:F)
 //   BACKFILL_SINCE         Oldest post to read on startup, YYYY-MM-DD (default 2025-12-01)
@@ -322,7 +322,7 @@ function recordsFromMessage(kind, message) {
   const { rows, warning } = buildRows(kind, message);
   const records = rows.map((r) => {
     const day = Math.floor(r[0]);
-    if (kind === 'time') return { day, name: String(r[1] || '').toLowerCase(), minutes: r[2] === '' ? null : r[2] };
+    if (kind === 'time') return { day, name: String(r[1] || '').toLowerCase(), display: String(r[1] || '').trim(), minutes: r[2] === '' ? null : r[2] };
     return { day };
   });
   return { records, warning };
@@ -335,7 +335,7 @@ function allRecords() {
 }
 
 // ---------------------------------------------------------------------------
-// The block written to the sheet: 9 columns x 36 rows, always the same shape,
+// The block written to the sheet: 9 columns x 49 rows, always the same shape,
 // so chart ranges pointing at it never need changing.
 // ---------------------------------------------------------------------------
 
@@ -407,7 +407,42 @@ function buildSummary(data, today, updatedText = '', opts = {}) {
     const key = thisMonth - n;
     periodRow(monthLabel(key), (r) => monthKeyOf(r.day) === key);
   }
+  row([]);
+
+  // Leaderboards: top recruiters by hours, this week (left) and this month (right), side by side.
+  const top = leaderboard(data.time, (r) => r.day >= thisWeek && r.day < thisWeek + 7, LEADERBOARD_SIZE);
+  const topMonth = leaderboard(data.time, (r) => monthKeyOf(r.day) === thisMonth, LEADERBOARD_SIZE);
+  row([`Top recruiters, week of ${weekLabel(thisWeek)}`, '', '', '', '', `Top recruiters, ${monthLabel(thisMonth)}`]);
+  row(['Rank', 'Recruiter', 'Hours', 'Sessions', '', 'Rank', 'Recruiter', 'Hours', 'Sessions']);
+  for (let i = 0; i < LEADERBOARD_SIZE; i++) {
+    const w = top[i]; const m = topMonth[i];
+    row([
+      w ? i + 1 : '', w ? w.name : '', w ? w.hours : '', w ? w.sessions : '', '',
+      m ? i + 1 : '', m ? m.name : '', m ? m.hours : '', m ? m.sessions : '',
+    ]);
+  }
   return grid;
+}
+
+const LEADERBOARD_SIZE = 10;
+const BLOCK_ROWS = 49; // 36 rows of numbers, a blank row, then the 12-row leaderboard
+
+// Hours per recruiter for the sessions that match, highest first.
+// Names are grouped ignoring capitals and shown the way they were most recently written.
+function leaderboard(sessions, match, size) {
+  const by = new Map();
+  for (const s of sessions) {
+    if (!match(s) || !s.name || s.name === 'n/a') continue;
+    const e = by.get(s.name) || { name: s.display || s.name, minutes: 0, sessions: 0, lastDay: -Infinity };
+    e.minutes += s.minutes || 0;
+    e.sessions += 1;
+    if (s.day >= e.lastDay && s.display) { e.name = s.display; e.lastDay = s.day; }
+    by.set(s.name, e);
+  }
+  return [...by.values()]
+    .map((e) => ({ name: e.name, hours: round1(e.minutes / 60), sessions: e.sessions, minutes: e.minutes }))
+    .sort((a, b) => b.minutes - a.minutes || b.sessions - a.sessions || a.name.localeCompare(b.name))
+    .slice(0, size);
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +498,7 @@ async function connectSheets() {
   if (!tab) throw new Error(`no tab called "${CONFIG.dashboardTab}". Tabs in the sheet: ${tabs.map((p) => p.title).join(', ')}. Set DASHBOARD_TAB.`);
 
   // Make sure the tab is wide and tall enough for the block (new tabs stop at column Z).
-  const b = blockRange(36, 9);
+  const b = blockRange(BLOCK_ROWS, 9);
   const grid = tab.gridProperties || {};
   const requests = [];
   if ((grid.columnCount || 26) < b.c1) requests.push({ appendDimension: { sheetId: tab.sheetId, dimension: 'COLUMNS', length: b.c1 - (grid.columnCount || 26) } });
@@ -596,7 +631,7 @@ async function ensureCharts() {
       console.log(`[charts] ${CONFIG.dashboardTab} already has ${tab.charts.length} chart(s), leaving them alone`);
       return;
     }
-    const requests = buildChartRequests(tab.properties.sheetId, blockRange(36, 9, (await locateBlock()).start));
+    const requests = buildChartRequests(tab.properties.sheetId, blockRange(BLOCK_ROWS, 9, (await locateBlock()).start));
     if (CONFIG.dryRun) { console.log(`[dry run] would add ${requests.length} starter charts to ${CONFIG.dashboardTab}`); return; }
     await withRetry(() => sheets.spreadsheets.batchUpdate({ spreadsheetId: CONFIG.sheetId, requestBody: { requests } }), 'add charts');
     console.log(`[charts] added ${requests.length} starter charts to ${CONFIG.dashboardTab}`);
@@ -864,5 +899,5 @@ if (require.main === module) {
 
 module.exports = {
   forwardedOriginal, parseFields, parseMinutes, splitUsernames, firstUsername, buildRows, sheetsSerial, labelToKey,
-  restyleSpec, hexToRgb, findMarkers, BLOCK_MARKER, recordsFromMessage, memberLogType, handleMessage, cache, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
+  restyleSpec, hexToRgb, leaderboard, findMarkers, BLOCK_MARKER, recordsFromMessage, memberLogType, handleMessage, cache, buildSummary, parseEventRows, blockRange, buildChartRequests, weekStartOf, dayOfWeek, monthKeyOf, dateToSerial, CONFIG,
 };
